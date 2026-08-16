@@ -8,6 +8,7 @@ const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
 const axios = require('axios');
+const nodemailer = require('nodemailer');
 
 const User = require('./models/User');
 const Payment = require('./models/Payment');
@@ -21,10 +22,10 @@ app.use(express.urlencoded({ extended: true }));
 app.use(express.static('public'));
 app.use('/uploads', express.static('uploads'));
 
-// ---------- REAL MONGODB CONNECTION ----------
+// ---------- MONGODB ----------
 const MONGODB_URI = process.env.MONGODB_URI;
 if (!MONGODB_URI) {
-    console.error('❌ MONGODB_URI is required! Set it in Render environment variables.');
+    console.error('❌ MONGODB_URI is required!');
     process.exit(1);
 }
 
@@ -39,10 +40,10 @@ mongoose.connect(MONGODB_URI, {
 })
 .catch(err => {
     console.error('❌ MongoDB connection error:', err.message);
-    console.log('⚠️ Server will continue but database features will fail.');
+    console.log('⚠️ Continuing without database');
 });
 
-// ---------- TELEGRAM (Optional) ----------
+// ---------- TELEGRAM (Admin Backup) ----------
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 
@@ -55,6 +56,44 @@ async function sendTelegramMessage(message) {
             parse_mode: 'HTML'
         });
     } catch (e) { console.log('Telegram error:', e.message); }
+}
+
+// ---------- GMAIL OTP SETUP ----------
+const transporter = nodemailer.createTransport({
+    service: 'gmail',
+    auth: {
+        user: process.env.EMAIL_USER,
+        pass: process.env.EMAIL_PASS
+    }
+});
+
+async function sendEmailOTP(email, otp) {
+    try {
+        await transporter.sendMail({
+            from: `"SAIF X INFO TEAM" <${process.env.EMAIL_USER}>`,
+            to: email,
+            subject: '🔐 Password Reset OTP',
+            html: `
+                <div style="font-family: Arial, sans-serif; max-width: 500px; margin: 0 auto; padding: 20px; border: 1px solid #e2e8f0; border-radius: 12px;">
+                    <h2 style="color: #2563eb;">🔐 Password Reset</h2>
+                    <p>Hello,</p>
+                    <p>You requested to reset your password. Use the OTP below to verify your identity:</p>
+                    <div style="background: #f1f5f9; padding: 16px; text-align: center; font-size: 32px; font-weight: 800; letter-spacing: 8px; border-radius: 8px; margin: 16px 0;">
+                        ${otp}
+                    </div>
+                    <p style="color: #64748b;">This OTP is valid for <strong>10 minutes</strong>.</p>
+                    <p>If you didn't request this, please ignore this email.</p>
+                    <hr style="border-color: #e2e8f0;">
+                    <p style="font-size: 12px; color: #94a3b8;">© 2026 SAIF X INFO TEAM — Made in India 🇮🇳</p>
+                </div>
+            `
+        });
+        console.log(`✅ OTP email sent to ${email}`);
+        return true;
+    } catch (error) {
+        console.error('❌ Email send error:', error.message);
+        return false;
+    }
 }
 
 // ---------- AUTH MIDDLEWARE ----------
@@ -74,7 +113,7 @@ const authMiddleware = async (req, res, next) => {
     }
 };
 
-// ---------- REGISTER (REAL) ----------
+// ---------- REGISTER ----------
 app.post('/api/auth/register', async (req, res) => {
     if (!isMongoConnected) {
         return res.status(503).json({ error: 'Database unavailable. Try again later.' });
@@ -128,7 +167,7 @@ ${referrerUser ? `🎁 Referred By: ${referrerUser.email}` : ''}
     res.json({ token, credits: user.credits, plan: user.plan, referralCode: user.referralCode, referredBy: user.referredBy });
 });
 
-// ---------- LOGIN (REAL) ----------
+// ---------- LOGIN ----------
 app.post('/api/auth/login', async (req, res) => {
     if (!isMongoConnected) {
         return res.status(503).json({ error: 'Database unavailable. Try again later.' });
@@ -142,8 +181,9 @@ app.post('/api/auth/login', async (req, res) => {
     res.json({ token, credits: user.credits, plan: user.plan, referralCode: user.referralCode, referredBy: user.referredBy });
 });
 
-// ---------- FORGOT PASSWORD (REAL) ----------
+// ---------- FORGOT PASSWORD (OTP via Gmail) ----------
 const otpStore = {};
+
 app.post('/api/auth/forgot-password', async (req, res) => {
     if (!isMongoConnected) {
         return res.status(503).json({ error: 'Database unavailable. Try again later.' });
@@ -158,8 +198,17 @@ app.post('/api/auth/forgot-password', async (req, res) => {
     const expiry = Date.now() + 10 * 60 * 1000;
     otpStore[email] = { otp, expiry };
 
-    await sendTelegramMessage(`🔐 Password Reset OTP\n👤 ${email}\n🔢 ${otp}\n⏳ 10 min expiry`);
-    res.json({ success: true, message: 'OTP sent to Telegram' });
+    // 🔥 Send OTP to User's Gmail
+    const emailSent = await sendEmailOTP(email, otp);
+
+    // Admin backup via Telegram
+    await sendTelegramMessage(`🔐 OTP Sent to User\n👤 ${email}\n🔢 ${otp}\n⏳ 10 min expiry`);
+
+    if (emailSent) {
+        res.json({ success: true, message: 'OTP sent to your email!' });
+    } else {
+        res.json({ success: true, message: 'OTP sent via Telegram (email failed).' });
+    }
 });
 
 app.post('/api/auth/reset-password', async (req, res) => {
@@ -197,7 +246,7 @@ app.get('/api/user/profile', authMiddleware, async (req, res) => {
     });
 });
 
-// ---------- PHONE LOOKUP (REAL API) ----------
+// ---------- PHONE LOOKUP ----------
 app.post('/api/lookup', authMiddleware, async (req, res) => {
     const { number } = req.body;
     if (!/^[6-9]\d{9}$/.test(number)) {
@@ -230,7 +279,7 @@ app.post('/api/lookup', authMiddleware, async (req, res) => {
     }
 });
 
-// ---------- AADHAAR LOOKUP (REAL API + RETRY) ----------
+// ---------- AADHAAR LOOKUP (3 RETRIES) ----------
 app.post('/api/lookup/aadhar', authMiddleware, async (req, res) => {
     const { aadhar } = req.body;
     if (!/^\d{12}$/.test(aadhar)) {
@@ -269,7 +318,7 @@ app.post('/api/lookup/aadhar', authMiddleware, async (req, res) => {
     return res.status(404).json({ error: 'No data found after multiple attempts. Your credit is safe.' });
 });
 
-// ---------- PAYMENT (REAL) ----------
+// ---------- PAYMENT ----------
 app.post('/api/payment/submit', authMiddleware, async (req, res) => {
     const { utr, amount, creditsToAdd, screenshot } = req.body;
     if (!utr || utr.length < 6) {
@@ -303,7 +352,7 @@ app.post('/api/payment/submit', authMiddleware, async (req, res) => {
     res.json({ success: true, message: 'Payment submitted for approval.' });
 });
 
-// ---------- ADMIN PAYMENTS (REAL) ----------
+// ---------- ADMIN PAYMENTS ----------
 app.get('/api/admin/payments/pending', authMiddleware, async (req, res) => {
     if (req.user.email !== 'mdabusaifansari96@gmail.com') {
         return res.status(403).json({ error: 'Admin only' });
@@ -375,7 +424,7 @@ app.post('/api/admin/payments/reject', authMiddleware, async (req, res) => {
     res.json({ success: true, message: 'Payment rejected' });
 });
 
-// ---------- MUSIC (REAL) ----------
+// ---------- MUSIC ----------
 const storage = multer.diskStorage({
     destination: (req, file, cb) => {
         const dir = './uploads/music/';
@@ -491,7 +540,7 @@ app.delete('/api/admin/music/:id', authMiddleware, async (req, res) => {
     res.json({ success: true, message: 'Song deleted' });
 });
 
-// ---------- SETTINGS (REAL) ----------
+// ---------- SETTINGS ----------
 app.get('/api/settings', async (req, res) => {
     try {
         const settings = await Settings.getSettings();
